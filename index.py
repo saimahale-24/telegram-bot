@@ -31,13 +31,14 @@ model = genai.GenerativeModel('gemini-1.5-flash')
 
 # --- 2. BUTTONS MENU ---
 def get_main_menu(role):
+    # Fix: Treat 'admin' same as 'owner'
     if role == 'employee':
         keyboard = [
             [InlineKeyboardButton("📝 Log Work", callback_data='btn_log')],
             [InlineKeyboardButton("📋 My Tasks", callback_data='btn_my_tasks')],
             [InlineKeyboardButton("📅 My History", callback_data='btn_history')]
         ]
-    elif role == 'owner':
+    elif role == 'owner' or role == 'admin':
         keyboard = [
             [InlineKeyboardButton("➕ Assign Task", callback_data='btn_assign')],
             [InlineKeyboardButton("📊 Team Progress", callback_data='btn_status')]
@@ -59,6 +60,9 @@ async def start(update: Update, context):
         )
         return
 
+    # RESET STATE on Start
+    users_col.update_one({"user_id": user.id}, {"$set": {"state": None}})
+
     role = user_data.get('role')
     await update.message.reply_text(
         f"👋 Welcome {user_data['name']}!",
@@ -72,11 +76,19 @@ async def button_click(update: Update, context):
     user_id = query.from_user.id
     user_data = users_col.find_one({"user_id": user_id})
 
+    # --- STATE MANAGEMENT: Save state to DB, not Memory ---
     if data == 'btn_log':
+        users_col.update_one({"user_id": user_id}, {"$set": {"state": "log_entry"}})
         await query.edit_message_text("✍️ Type your work update now:")
-        context.user_data['expecting'] = 'log_entry'
+
+    elif data == 'btn_assign':
+        users_col.update_one({"user_id": user_id}, {"$set": {"state": "assign_task"}})
+        await query.edit_message_text("👉 Type the task naturally.\nExample: 'Assign logo design to Rahul'")
 
     elif data == 'btn_my_tasks':
+        # Clear state just in case
+        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+        
         tasks = list(tasks_col.find({"assigned_to_id": user_id, "status": "pending"}))
         if not tasks:
             await query.edit_message_text("✅ You have no pending tasks!", reply_markup=get_main_menu('employee'))
@@ -86,22 +98,20 @@ async def button_click(update: Update, context):
             msg += f"• {t['task_detail']} (By: {t['assigned_by']})\n"
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=get_main_menu('employee'))
 
-    elif data == 'btn_assign':
-        await query.edit_message_text("👉 Type the task naturally.\nExample: 'Assign logo design to Rahul'")
-        context.user_data['expecting'] = 'assign_task'
-
     elif data == 'btn_status':
+        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
         await query.edit_message_text("⏳ AI is analyzing team logs...")
         await generate_status_report(update, context)
 
 async def handle_text(update: Update, context):
     user_id = update.effective_user.id
     text = update.message.text
-    state = context.user_data.get('expecting')
+    
+    # --- FETCH STATE FROM DB ---
     user_data = users_col.find_one({"user_id": user_id})
+    if not user_data: return
 
-    if not user_data: 
-        return
+    state = user_data.get('state') # Retrieve what the user was doing
 
     if state == 'log_entry':
         logs_col.insert_one({
@@ -110,8 +120,9 @@ async def handle_text(update: Update, context):
             "log": text,
             "date": datetime.now()
         })
+        # Reset State
+        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
         await update.message.reply_text("✅ Work Logged!", reply_markup=get_main_menu(user_data['role']))
-        context.user_data['expecting'] = None
 
     elif state == 'assign_task':
         employees = list(users_col.find({"role": "employee"}))
@@ -140,6 +151,9 @@ async def handle_text(update: Update, context):
                     "status": "pending",
                     "created_at": datetime.now()
                 })
+                # Reset State
+                users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+                
                 await update.message.reply_text(
                     f"✅ Task assigned to **{target_emp['name']}**:\n_{task_detail}_", 
                     parse_mode='Markdown',
@@ -149,62 +163,48 @@ async def handle_text(update: Update, context):
                 await update.message.reply_text(f"❌ Could not find employee named '{target_emp_name}'. Try again.")
         except Exception:
             await update.message.reply_text("❌ AI failed to understand. Please try again.")
-        context.user_data['expecting'] = None
 
     else:
+        # User is typing without clicking a button
         await update.message.reply_text("Please use the buttons.", reply_markup=get_main_menu(user_data['role']))
 
 async def generate_status_report(update, context):
     logs = list(logs_col.find().sort("date", -1).limit(15))
     
-    # Get the user's role so we know which buttons to show back
+    # Get role for buttons
     user_id = update.effective_user.id
     user_data = users_col.find_one({"user_id": user_id})
-    role = user_data.get('role', 'owner') # Default to owner if missing
+    role = user_data.get('role', 'owner')
 
     if not logs:
-        # OLD: await update.effective_message.reply_text("No logs found.")
-        # NEW: Send text AND buttons
         await update.effective_message.reply_text(
-            "📭 **No logs found.**\nNo work has been recorded recently.", 
+            "📭 **No logs found.**", 
             parse_mode='Markdown',
-            reply_markup=get_main_menu(role) # <--- THIS BRINGS THE BUTTONS BACK
+            reply_markup=get_main_menu(role)
         )
         return
 
     log_text = "\n".join([f"- {l['name']}: {l['log']}" for l in logs])
     prompt = f"Summarize these logs for the agency owner. Group by employee:\n{log_text}"
     response = model.generate_content(prompt)
-    
-    # Send the AI summary AND the buttons
-    await update.effective_message.reply_text(
-        response.text, 
-        reply_markup=get_main_menu(role) # <--- THIS BRINGS THE BUTTONS BACK
-    )
+    await update.effective_message.reply_text(response.text, reply_markup=get_main_menu(role))
 
-# --- 4. THE WEBHOOK (FIXED FOR VERCEL) ---
+# --- WEBHOOK ---
 @app.route('/', methods=['POST'])
 def webhook():
     if request.method == "POST":
-        # Build the application fresh every time
         application = ApplicationBuilder().token(TOKEN).build()
-        
-        # Add Handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_click))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         
-        # Decode the update
         update = Update.de_json(request.get_json(force=True), application.bot)
         
-        # ERROR FIX: Explicitly initialize the app before processing
         async def process():
             await application.initialize()
             await application.process_update(update)
             await application.shutdown()
 
         asyncio.run(process())
-        
         return "OK"
     return "Bot is running"
-
