@@ -156,13 +156,31 @@ async def handle_text(update: Update, context):
 
 async def generate_status_report(update, context):
     logs = list(logs_col.find().sort("date", -1).limit(15))
+    
+    # Get the user's role so we know which buttons to show back
+    user_id = update.effective_user.id
+    user_data = users_col.find_one({"user_id": user_id})
+    role = user_data.get('role', 'owner') # Default to owner if missing
+
     if not logs:
-        await update.effective_message.reply_text("No logs found.")
+        # OLD: await update.effective_message.reply_text("No logs found.")
+        # NEW: Send text AND buttons
+        await update.effective_message.reply_text(
+            "📭 **No logs found.**\nNo work has been recorded recently.", 
+            parse_mode='Markdown',
+            reply_markup=get_main_menu(role) # <--- THIS BRINGS THE BUTTONS BACK
+        )
         return
+
     log_text = "\n".join([f"- {l['name']}: {l['log']}" for l in logs])
     prompt = f"Summarize these logs for the agency owner. Group by employee:\n{log_text}"
     response = model.generate_content(prompt)
-    await update.effective_message.reply_text(response.text)
+    
+    # Send the AI summary AND the buttons
+    await update.effective_message.reply_text(
+        response.text, 
+        reply_markup=get_main_menu(role) # <--- THIS BRINGS THE BUTTONS BACK
+    )
 
 # --- 4. THE WEBHOOK (FIXED FOR VERCEL) ---
 @app.route('/', methods=['POST'])
@@ -189,3 +207,4 @@ def webhook():
         
         return "OK"
     return "Bot is running"
+
