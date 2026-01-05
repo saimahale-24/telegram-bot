@@ -180,16 +180,27 @@ async def generate_status_report(update, context):
     
     await update.effective_message.reply_text(response.text)
 
-# --- WEBHOOK ---
+# --- WEBHOOK (THE FIXED VERSION) ---
 @app.route('/', methods=['POST'])
 def webhook():
     if request.method == "POST":
         application = ApplicationBuilder().token(TOKEN).build()
+        
+        # Re-add your handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_click))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         
+        # Parse the incoming update
         update = Update.de_json(request.get_json(force=True), application.bot)
-        asyncio.run(application.process_update(update))
+        
+        # --- THE FIX: Manually start, process, and stop ---
+        async def main():
+            await application.initialize()  # Turn the engine on
+            await application.process_update(update) # Process the message
+            await application.shutdown()    # Turn the engine off
+            
+        asyncio.run(main())
+        
         return "OK"
     return "Bot is running"
