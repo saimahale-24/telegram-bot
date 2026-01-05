@@ -23,7 +23,7 @@ client = MongoClient(MONGO_URI)
 db = client['agency_db']
 users_col = db['users']
 logs_col = db['logs']
-tasks_col = db['tasks']  # <--- NEW: Stores the To-Do list
+tasks_col = db['tasks']
 
 # AI Setup
 genai.configure(api_key=GEMINI_KEY)
@@ -34,20 +34,19 @@ def get_main_menu(role):
     if role == 'employee':
         keyboard = [
             [InlineKeyboardButton("📝 Log Work", callback_data='btn_log')],
-            [InlineKeyboardButton("📋 My Tasks", callback_data='btn_my_tasks')], # <--- NEW
+            [InlineKeyboardButton("📋 My Tasks", callback_data='btn_my_tasks')],
             [InlineKeyboardButton("📅 My History", callback_data='btn_history')]
         ]
-    elif role == 'owner':  # <--- NEW ROLE
+    elif role == 'owner':
         keyboard = [
-            [InlineKeyboardButton("➕ Assign Task", callback_data='btn_assign')], # <--- NEW
+            [InlineKeyboardButton("➕ Assign Task", callback_data='btn_assign')],
             [InlineKeyboardButton("📊 Team Progress", callback_data='btn_status')]
         ]
     else:
-        # Default for clients
         return InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data='btn_help')]])
     return InlineKeyboardMarkup(keyboard)
 
-# --- 3. BOT LOGIC ---
+# --- 3. BOT COMMANDS ---
 
 async def start(update: Update, context):
     user = update.effective_user
@@ -71,28 +70,22 @@ async def button_click(update: Update, context):
     await query.answer()
     data = query.data
     user_id = query.from_user.id
+    user_data = users_col.find_one({"user_id": user_id})
 
-    # --- EMPLOYEE ACTIONS ---
     if data == 'btn_log':
         await query.edit_message_text("✍️ Type your work update now:")
         context.user_data['expecting'] = 'log_entry'
 
     elif data == 'btn_my_tasks':
-        # 1. Find tasks assigned to this user that are 'pending'
         tasks = list(tasks_col.find({"assigned_to_id": user_id, "status": "pending"}))
-        
         if not tasks:
             await query.edit_message_text("✅ You have no pending tasks!", reply_markup=get_main_menu('employee'))
             return
-
-        # 2. Show tasks
         msg = "📋 **Your Pending Tasks:**\n\n"
         for t in tasks:
             msg += f"• {t['task_detail']} (By: {t['assigned_by']})\n"
-        
         await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=get_main_menu('employee'))
 
-    # --- OWNER ACTIONS ---
     elif data == 'btn_assign':
         await query.edit_message_text("👉 Type the task naturally.\nExample: 'Assign logo design to Rahul'")
         context.user_data['expecting'] = 'assign_task'
@@ -107,7 +100,9 @@ async def handle_text(update: Update, context):
     state = context.user_data.get('expecting')
     user_data = users_col.find_one({"user_id": user_id})
 
-    # --- SCENARIO 1: LOGGING WORK (Employee) ---
+    if not user_data: 
+        return
+
     if state == 'log_entry':
         logs_col.insert_one({
             "user_id": user_id,
@@ -118,13 +113,10 @@ async def handle_text(update: Update, context):
         await update.message.reply_text("✅ Work Logged!", reply_markup=get_main_menu(user_data['role']))
         context.user_data['expecting'] = None
 
-    # --- SCENARIO 2: ASSIGNING TASKS (Owner) ---
     elif state == 'assign_task':
-        # 1. Get list of all employees to help AI match names
         employees = list(users_col.find({"role": "employee"}))
         emp_names = [e['name'] for e in employees]
         
-        # 2. Ask AI to extract Who and What
         prompt = f"""
         Extract the 'task' and the 'employee_name' from this text: "{text}"
         Available Employees: {', '.join(emp_names)}
@@ -133,18 +125,13 @@ async def handle_text(update: Update, context):
         response = model.generate_content(prompt)
         
         try:
-            # clean up AI response to get pure JSON
             cleaned_json = response.text.replace('```json', '').replace('```', '').strip()
             data = json.loads(cleaned_json)
-            
             target_emp_name = data.get('employee_name')
             task_detail = data.get('task')
 
-            # 3. Find the employee's ID from the name
             target_emp = users_col.find_one({"name": target_emp_name})
-            
             if target_emp:
-                # 4. Save to TASKS collection
                 tasks_col.insert_one({
                     "assigned_to_id": target_emp['user_id'],
                     "assigned_to_name": target_emp['name'],
@@ -160,47 +147,45 @@ async def handle_text(update: Update, context):
                 )
             else:
                 await update.message.reply_text(f"❌ Could not find employee named '{target_emp_name}'. Try again.")
-
-        except Exception as e:
+        except Exception:
             await update.message.reply_text("❌ AI failed to understand. Please try again.")
-        
         context.user_data['expecting'] = None
 
     else:
-        # Normal chat
         await update.message.reply_text("Please use the buttons.", reply_markup=get_main_menu(user_data['role']))
 
-# --- HELPER: REPORT GENERATION ---
 async def generate_status_report(update, context):
     logs = list(logs_col.find().sort("date", -1).limit(15))
+    if not logs:
+        await update.effective_message.reply_text("No logs found.")
+        return
     log_text = "\n".join([f"- {l['name']}: {l['log']}" for l in logs])
-    
     prompt = f"Summarize these logs for the agency owner. Group by employee:\n{log_text}"
     response = model.generate_content(prompt)
-    
     await update.effective_message.reply_text(response.text)
 
-# --- WEBHOOK (THE FIXED VERSION) ---
+# --- 4. THE WEBHOOK (FIXED FOR VERCEL) ---
 @app.route('/', methods=['POST'])
 def webhook():
     if request.method == "POST":
+        # Build the application fresh every time
         application = ApplicationBuilder().token(TOKEN).build()
         
-        # Re-add your handlers
+        # Add Handlers
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CallbackQueryHandler(button_click))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
         
-        # Parse the incoming update
+        # Decode the update
         update = Update.de_json(request.get_json(force=True), application.bot)
         
-        # --- THE FIX: Manually start, process, and stop ---
-        async def main():
-            await application.initialize()  # Turn the engine on
-            await application.process_update(update) # Process the message
-            await application.shutdown()    # Turn the engine off
-            
-        asyncio.run(main())
+        # ERROR FIX: Explicitly initialize the app before processing
+        async def process():
+            await application.initialize()
+            await application.process_update(update)
+            await application.shutdown()
+
+        asyncio.run(process())
         
         return "OK"
     return "Bot is running"
