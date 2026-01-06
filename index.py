@@ -100,11 +100,11 @@ async def button_click(update: Update, context):
         
         if data == 'btn_log':
             users_col.update_one({"user_id": user_id}, {"$set": {"state": "log_entry"}})
-            await query.edit_message_text("✍️ **Ready.** Type your work update now:")
+            await query.edit_message_text("Type your work update now:")
 
         elif data == 'btn_assign':
             users_col.update_one({"user_id": user_id}, {"$set": {"state": "assign_task"}})
-            await query.edit_message_text("👉 **Ready.** Type task (e.g. 'Assign logo to Rahul')")
+            await query.edit_message_text("Type task (e.g. 'Assign logo to Rahul')")
 
         elif data == 'btn_my_tasks':
             users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
@@ -209,3 +209,4 @@ def webhook():
         
         return "OK"
     return "Bot is running"
+
