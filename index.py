@@ -1,7 +1,7 @@
 import os
 import asyncio
 import json
-import google.generativeai as genai
+import logging
 from flask import Flask, request
 from pymongo import MongoClient
 from datetime import datetime
@@ -10,28 +10,54 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, 
     MessageHandler, CallbackQueryHandler, filters
 )
+from openai import OpenAI  # <--- NEW LIBRARY
 
-# --- 1. CONFIGURATION ---
+# --- CONFIGURATION ---
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 MONGO_URI = os.environ.get("MONGO_URI")
-GEMINI_KEY = os.environ.get("GEMINI_KEY")
+OPENROUTER_KEY = os.environ.get("OPENROUTER_KEY") # <--- NEW KEY NAME
+
+# Setup Logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.ERROR)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Database Setup
-client = MongoClient(MONGO_URI)
-db = client['agency_db']
-users_col = db['users']
-logs_col = db['logs']
-tasks_col = db['tasks']
+# --- DATABASE CONNECTION ---
+try:
+    client = MongoClient(MONGO_URI)
+    db = client['agency_db']
+    users_col = db['users']
+    logs_col = db['logs']
+    tasks_col = db['tasks']
+except Exception as e:
+    logger.error(f"DATABASE CONNECT ERROR: {e}")
 
-# AI Setup
-genai.configure(api_key=GEMINI_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
+# --- AI SETUP (OPENROUTER) ---
+# We use the OpenAI client but point it to OpenRouter's URL
+ai_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_KEY,
+)
 
-# --- 2. BUTTONS MENU ---
+# HELPER: Call AI
+def ask_ai(prompt):
+    try:
+        completion = ai_client.chat.completions.create(
+            # YOU CAN CHANGE THIS MODEL NAME TO ANYTHING (e.g., "anthropic/claude-3-haiku")
+            model="nvidia/nemotron-3-nano-30b-a3b:free", 
+            messages=[
+                {"role": "system", "content": "You are a helpful agency assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        logger.error(f"AI ERROR: {e}")
+        return "⚠️ AI Error. Please try again."
+
+# --- HELPER FUNCTIONS ---
 def get_main_menu(role):
-    # Fix: Treat 'admin' same as 'owner'
     if role == 'employee':
         keyboard = [
             [InlineKeyboardButton("📝 Log Work", callback_data='btn_log')],
@@ -47,147 +73,117 @@ def get_main_menu(role):
         return InlineKeyboardMarkup([[InlineKeyboardButton("❓ Help", callback_data='btn_help')]])
     return InlineKeyboardMarkup(keyboard)
 
-# --- 3. BOT COMMANDS ---
+# --- BOT COMMANDS ---
 
 async def start(update: Update, context):
-    user = update.effective_user
-    user_data = users_col.find_one({"user_id": user.id})
+    try:
+        user = update.effective_user
+        user_data = users_col.find_one({"user_id": user.id})
+        
+        if not user_data:
+            await update.message.reply_text(f"⛔ **Access Denied**\nID: `{user.id}`", parse_mode='Markdown')
+            return
+
+        users_col.update_one({"user_id": user.id}, {"$set": {"state": None}})
+        role = user_data.get('role')
+        await update.message.reply_text(f"👋 Welcome {user_data['name']}!", reply_markup=get_main_menu(role))
     
-    if not user_data:
-        await update.message.reply_text(
-            f"⛔ **Access Denied**\nYour ID is: `{user.id}`\nSend this to the Owner to get access.",
-            parse_mode='Markdown'
-        )
-        return
-
-    # RESET STATE on Start
-    users_col.update_one({"user_id": user.id}, {"$set": {"state": None}})
-
-    role = user_data.get('role')
-    await update.message.reply_text(
-        f"👋 Welcome {user_data['name']}!",
-        reply_markup=get_main_menu(role)
-    )
+    except Exception as e:
+        await update.message.reply_text(f"🔥 **Start Error:**\n{str(e)}")
 
 async def button_click(update: Update, context):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = query.from_user.id
-    user_data = users_col.find_one({"user_id": user_id})
-
-    # --- STATE MANAGEMENT: Save state to DB, not Memory ---
-    if data == 'btn_log':
-        users_col.update_one({"user_id": user_id}, {"$set": {"state": "log_entry"}})
-        await query.edit_message_text("✍️ Type your work update now:")
-
-    elif data == 'btn_assign':
-        users_col.update_one({"user_id": user_id}, {"$set": {"state": "assign_task"}})
-        await query.edit_message_text("👉 Type the task naturally.\nExample: 'Assign logo design to Rahul'")
-
-    elif data == 'btn_my_tasks':
-        # Clear state just in case
-        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+    try:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        user_id = query.from_user.id
         
-        tasks = list(tasks_col.find({"assigned_to_id": user_id, "status": "pending"}))
-        if not tasks:
-            await query.edit_message_text("✅ You have no pending tasks!", reply_markup=get_main_menu('employee'))
-            return
-        msg = "📋 **Your Pending Tasks:**\n\n"
-        for t in tasks:
-            msg += f"• {t['task_detail']} (By: {t['assigned_by']})\n"
-        await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=get_main_menu('employee'))
+        if data == 'btn_log':
+            users_col.update_one({"user_id": user_id}, {"$set": {"state": "log_entry"}})
+            await query.edit_message_text("✍️ **Ready.** Type your work update now:")
 
-    elif data == 'btn_status':
-        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
-        await query.edit_message_text("⏳ AI is analyzing team logs...")
-        await generate_status_report(update, context)
+        elif data == 'btn_assign':
+            users_col.update_one({"user_id": user_id}, {"$set": {"state": "assign_task"}})
+            await query.edit_message_text("👉 **Ready.** Type task (e.g. 'Assign logo to Rahul')")
+
+        elif data == 'btn_my_tasks':
+            users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+            tasks = list(tasks_col.find({"assigned_to_id": user_id, "status": "pending"}))
+            if not tasks:
+                await query.edit_message_text("✅ No pending tasks!", reply_markup=get_main_menu('employee'))
+                return
+            msg = "📋 **Your Pending Tasks:**\n\n" + "\n".join([f"• {t['task_detail']}" for t in tasks])
+            await query.edit_message_text(msg, parse_mode='Markdown', reply_markup=get_main_menu('employee'))
+
+        elif data == 'btn_status':
+            users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+            await query.edit_message_text("⏳ AI is reading logs...")
+            await generate_status_report(update, context)
+            
+    except Exception as e:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🔥 Button Error: {e}")
 
 async def handle_text(update: Update, context):
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    # --- FETCH STATE FROM DB ---
-    user_data = users_col.find_one({"user_id": user_id})
-    if not user_data: return
+    try:
+        user_id = update.effective_user.id
+        text = update.message.text
+        user_data = users_col.find_one({"user_id": user_id})
+        if not user_data: return
+        state = user_data.get('state')
 
-    state = user_data.get('state') # Retrieve what the user was doing
+        if state == 'log_entry':
+            logs_col.insert_one({
+                "user_id": user_id, "name": user_data['name'], "log": text, "date": datetime.now()
+            })
+            users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
+            await update.message.reply_text("✅ Logged!", reply_markup=get_main_menu(user_data['role']))
 
-    if state == 'log_entry':
-        logs_col.insert_one({
-            "user_id": user_id,
-            "name": user_data['name'],
-            "log": text,
-            "date": datetime.now()
-        })
-        # Reset State
-        users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
-        await update.message.reply_text("✅ Work Logged!", reply_markup=get_main_menu(user_data['role']))
-
-    elif state == 'assign_task':
-        employees = list(users_col.find({"role": "employee"}))
-        emp_names = [e['name'] for e in employees]
-        
-        prompt = f"""
-        Extract the 'task' and the 'employee_name' from this text: "{text}"
-        Available Employees: {', '.join(emp_names)}
-        Return ONLY valid JSON like: {{"task": "...", "employee_name": "..."}}
-        """
-        response = model.generate_content(prompt)
-        
-        try:
-            cleaned_json = response.text.replace('```json', '').replace('```', '').strip()
-            data = json.loads(cleaned_json)
-            target_emp_name = data.get('employee_name')
-            task_detail = data.get('task')
-
-            target_emp = users_col.find_one({"name": target_emp_name})
-            if target_emp:
+        elif state == 'assign_task':
+            employees = list(users_col.find({"role": "employee"}))
+            emp_names = [e['name'] for e in employees]
+            
+            # --- OPENROUTER CALL ---
+            prompt = f"Extract 'task' and 'employee_name' from: '{text}'. Employees: {emp_names}. Return JSON."
+            response_text = ask_ai(prompt)
+            
+            # Clean JSON
+            cleaned = response_text.replace('```json', '').replace('```', '').strip()
+            data = json.loads(cleaned)
+            
+            target = users_col.find_one({"name": data.get('employee_name')})
+            if target:
                 tasks_col.insert_one({
-                    "assigned_to_id": target_emp['user_id'],
-                    "assigned_to_name": target_emp['name'],
-                    "assigned_by": user_data['name'],
-                    "task_detail": task_detail,
-                    "status": "pending",
-                    "created_at": datetime.now()
+                    "assigned_to_id": target['user_id'], "assigned_to_name": target['name'],
+                    "assigned_by": user_data['name'], "task_detail": data.get('task'),
+                    "status": "pending", "created_at": datetime.now()
                 })
-                # Reset State
                 users_col.update_one({"user_id": user_id}, {"$set": {"state": None}})
-                
-                await update.message.reply_text(
-                    f"✅ Task assigned to **{target_emp['name']}**:\n_{task_detail}_", 
-                    parse_mode='Markdown',
-                    reply_markup=get_main_menu('owner')
-                )
+                await update.message.reply_text(f"✅ Assigned to {target['name']}", reply_markup=get_main_menu('owner'))
             else:
-                await update.message.reply_text(f"❌ Could not find employee named '{target_emp_name}'. Try again.")
-        except Exception:
-            await update.message.reply_text("❌ AI failed to understand. Please try again.")
+                await update.message.reply_text("❌ Employee not found.", reply_markup=get_main_menu('owner'))
+        else:
+            await update.message.reply_text("Please use buttons.", reply_markup=get_main_menu(user_data['role']))
 
-    else:
-        # User is typing without clicking a button
-        await update.message.reply_text("Please use the buttons.", reply_markup=get_main_menu(user_data['role']))
+    except Exception as e:
+        await update.message.reply_text(f"🔥 Text Error: {e}")
 
 async def generate_status_report(update, context):
-    logs = list(logs_col.find().sort("date", -1).limit(15))
-    
-    # Get role for buttons
-    user_id = update.effective_user.id
-    user_data = users_col.find_one({"user_id": user_id})
-    role = user_data.get('role', 'owner')
+    try:
+        logs = list(logs_col.find().sort("date", -1).limit(15))
+        role = 'owner' # Default
+        
+        if not logs:
+            await update.effective_message.reply_text("📭 No logs.", reply_markup=get_main_menu(role))
+            return
 
-    if not logs:
-        await update.effective_message.reply_text(
-            "📭 **No logs found.**", 
-            parse_mode='Markdown',
-            reply_markup=get_main_menu(role)
-        )
-        return
-
-    log_text = "\n".join([f"- {l['name']}: {l['log']}" for l in logs])
-    prompt = f"Summarize these logs for the agency owner. Group by employee:\n{log_text}"
-    response = model.generate_content(prompt)
-    await update.effective_message.reply_text(response.text, reply_markup=get_main_menu(role))
+        log_text = "\n".join([f"- {l['name']}: {l['log']}" for l in logs])
+        
+        # --- OPENROUTER CALL ---
+        response_text = ask_ai(f"Summarize logs:\n{log_text}")
+        
+        await update.effective_message.reply_text(response_text, reply_markup=get_main_menu(role))
+    except Exception as e:
+         await update.effective_message.reply_text(f"🔥 AI Error: {e}")
 
 # --- WEBHOOK ---
 @app.route('/', methods=['POST'])
@@ -205,6 +201,11 @@ def webhook():
             await application.process_update(update)
             await application.shutdown()
 
-        asyncio.run(process())
+        try:
+            asyncio.run(process())
+        except Exception as e:
+            logger.error(f"WEBHOOK CRASH: {e}")
+            return "Error", 500
+        
         return "OK"
     return "Bot is running"
